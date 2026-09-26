@@ -418,6 +418,145 @@ def is_mouse_click(bstate):
     return bool(bstate & MOUSE_CLICK_MASK)
 
 
+def pixel_y_to_row(pixel_y, y_absinfo, term_height):
+    """Map a pointer Y coordinate to a curses row index."""
+    lo = y_absinfo.min
+    hi = y_absinfo.max
+    if hi <= lo or term_height < 1:
+        return min(max(0, pixel_y // 16), max(term_height - 1, 0))
+    span = hi - lo + 1
+    row = (pixel_y - lo) * term_height // span
+    return min(max(0, row), term_height - 1)
+
+
+def resolve_pointer_device(spec):
+    """Find the touchscreen or mouse evdev node (Pi console does not use curses mouse)."""
+    try:
+        from evdev import InputDevice, ecodes, list_devices
+    except ImportError:
+        return None
+
+    if spec and spec != "auto":
+        return spec
+
+    best_path = None
+    best_score = 0
+    for path in list_devices():
+        try:
+            dev = InputDevice(path)
+        except OSError:
+            continue
+        name = (dev.name or "").lower()
+        caps = dev.capabilities()
+        keys = caps.get(ecodes.EV_KEY, [])
+        abs_caps = caps.get(ecodes.EV_ABS, [])
+        rel_caps = caps.get(ecodes.EV_REL, [])
+
+        score = 0
+        if ecodes.BTN_TOUCH in keys:
+            score += 10
+        if ecodes.BTN_LEFT in keys:
+            score += 5
+        mt_y = getattr(ecodes, "ABS_MT_POSITION_Y", None)
+        if ecodes.ABS_X in abs_caps and ecodes.ABS_Y in abs_caps:
+            score += 10
+        elif mt_y is not None and mt_y in abs_caps:
+            score += 10
+        elif ecodes.REL_X in rel_caps and ecodes.REL_Y in rel_caps:
+            score += 6
+        if any(k in name for k in ("touch", "ft5406", "raspberrypi-ts", "ts")):
+            score += 20
+        if "mouse" in name:
+            score += 8
+        if "keyboard" in name or "kbd" in name:
+            score -= 50
+
+        if score > best_score:
+            best_score = score
+            best_path = path
+    return best_path if best_score > 0 else None
+
+
+class PointerListener(threading.Thread):
+    """Read Linux evdev pointer clicks (touchscreen or mouse) for tty1 consoles."""
+
+    _CLICK_CODES = None
+
+    def __init__(self, device_path, on_row_click, term_height_fn, stop_event):
+        super().__init__(daemon=True)
+        self.device_path = device_path
+        self.on_row_click = on_row_click
+        self.term_height_fn = term_height_fn
+        self._stop = stop_event
+        self._last_click = 0.0
+
+    def _maybe_click(self, term_row):
+        now = time.monotonic()
+        if now - self._last_click < 0.25:
+            return
+        self._last_click = now
+        self.on_row_click(term_row)
+
+    def run(self):
+        import select
+
+        from evdev import InputDevice, ecodes
+
+        if PointerListener._CLICK_CODES is None:
+            PointerListener._CLICK_CODES = frozenset(
+                c for c in (ecodes.BTN_LEFT, ecodes.BTN_TOUCH) if c is not None
+            )
+
+        dev = InputDevice(self.device_path)
+        caps = dev.capabilities()
+        abs_caps = caps.get(ecodes.EV_ABS, [])
+        mt_pos_y = getattr(ecodes, "ABS_MT_POSITION_Y", None)
+        mt_track = getattr(ecodes, "ABS_MT_TRACKING_ID", None)
+        absolute = ecodes.ABS_Y in abs_caps or (
+            mt_pos_y is not None and mt_pos_y in abs_caps
+        )
+        if ecodes.ABS_Y in abs_caps:
+            y_absinfo = dev.absinfo(ecodes.ABS_Y)
+        elif mt_pos_y is not None and mt_pos_y in abs_caps:
+            y_absinfo = dev.absinfo(mt_pos_y)
+        else:
+            y_absinfo = None
+        rel_y = 0
+        y = 0
+
+        def emit_row_click():
+            term_height = self.term_height_fn()
+            if absolute and y_absinfo is not None:
+                term_row = pixel_y_to_row(y, y_absinfo, term_height)
+            else:
+                term_row = min(rel_y // 16, max(term_height - 1, 0))
+            self._maybe_click(term_row)
+
+        while not self._stop.is_set():
+            try:
+                ready, _, _ = select.select([dev.fd], [], [], 0.25)
+                if not ready:
+                    continue
+                for event in dev.read():
+                    if self._stop.is_set():
+                        break
+                    if event.type == ecodes.EV_ABS:
+                        if event.code == ecodes.ABS_Y:
+                            y = event.value
+                        elif mt_pos_y is not None and event.code == mt_pos_y:
+                            y = event.value
+                        elif mt_track is not None and event.code == mt_track and event.value == -1:
+                            emit_row_click()
+                    elif event.type == ecodes.EV_REL and event.code == ecodes.REL_Y:
+                        rel_y = max(0, rel_y + event.value)
+                    elif event.type == ecodes.EV_KEY and event.code in PointerListener._CLICK_CODES:
+                        if event.value not in (0, 1):
+                            continue
+                        emit_row_click()
+            except OSError:
+                break
+
+
 def post_bridge(bridge_url, bridge_token, url, state):
     headers = {"Content-Type": "application/json"}
     if bridge_token:
@@ -600,14 +739,39 @@ def main_curses(stdscr, client, args, service_ids):
     )
     poller.start()
 
+    pointer_stop = threading.Event()
+    pointer_thread = None
     if args.bridge_url:
         curses.mousemask(MOUSE_CLICK_MASK)
         curses.mouseinterval(0)
+
+        def term_height_fn():
+            with state["lock"]:
+                return state.get("term_height", 24)
+
+        def on_row_click(term_row):
+            with state["lock"]:
+                scroll = state.get("scroll_pos", 0)
+                height = state.get("term_height", 24)
+                rows = list(state.get("rows", []))
+                resolved_rows = list(state.get("resolved_rows", []))
+            activate_incident_at_row(
+                term_row, scroll, height, rows, resolved_rows, state, args
+            )
+
+        if args.pointer_device:
+            pointer_thread = PointerListener(
+                args.pointer_device, on_row_click, term_height_fn, pointer_stop
+            )
+            pointer_thread.start()
 
     scroll_pos = 0
     try:
         while True:
             height, _ = stdscr.getmaxyx()
+            with state["lock"]:
+                state["scroll_pos"] = scroll_pos
+                state["term_height"] = height
             scroll_pos = draw(stdscr, state, scroll_pos)
             ch = stdscr.getch()
             if ch in (ord("q"), ord("Q")):
@@ -633,6 +797,9 @@ def main_curses(stdscr, client, args, service_ids):
             elif ch == curses.KEY_RESIZE:
                 stdscr.clear()
     finally:
+        pointer_stop.set()
+        if pointer_thread is not None:
+            pointer_thread.join(timeout=1)
         poller.stop()
 
 
@@ -679,6 +846,11 @@ def main():
         default=os.environ.get("PAGERDUTY_BRIDGE_TOKEN"),
         help="Shared secret for the laptop bridge (or set PAGERDUTY_BRIDGE_TOKEN)",
     )
+    parser.add_argument(
+        "--pointer-device",
+        default=os.environ.get("PAGERDUTY_POINTER_DEVICE", "auto"),
+        help="Mouse/touch evdev path, or 'auto' (default). Set PAGERDUTY_POINTER_DEVICE to override.",
+    )
     args = parser.parse_args()
 
     if not args.status:
@@ -703,6 +875,22 @@ def main():
             print(f"No PagerDuty service found matching '{args.service_name}'.")
             sys.exit(1)
         print(f"Filtering to service(s): {', '.join(names)}")
+
+    if args.bridge_url:
+        try:
+            import evdev  # noqa: F401
+        except ImportError:
+            print("Error: evdev is required when --bridge-url is set. Install with: pip install evdev")
+            sys.exit(1)
+        device = resolve_pointer_device(args.pointer_device)
+        if not device:
+            print(
+                "Error: no mouse/touch device found for clicks. Set --pointer-device or "
+                "PAGERDUTY_POINTER_DEVICE to an /dev/input/event* path."
+            )
+            sys.exit(1)
+        args.pointer_device = device
+        print(f"Pointer input: {device}")
 
     try:
         curses.wrapper(main_curses, client, args, service_ids)

@@ -104,6 +104,7 @@ Before the full-screen view opens, a service filter prints the matched service n
 | `--no-alert-severity` | off | Skip the extra alert request and color open incidents by urgency. |
 | `--bridge-url` | `PAGERDUTY_BRIDGE_URL` | POST incident URLs to the laptop bridge when you click a row (mouse or touchscreen). |
 | `--bridge-token` | `PAGERDUTY_BRIDGE_TOKEN` | Shared secret for the laptop bridge (optional). |
+| `--pointer-device` | `PAGERDUTY_POINTER_DEVICE` or `auto` | Mouse/touch `/dev/input/event*` path (used on the Pi console; curses mouse alone is not enough on `tty1`). |
 
 Examples:
 
@@ -156,7 +157,16 @@ If you use a host firewall, allow the bridge port from the Pi’s IP only.
 
 ### Pi: enable click-to-open
 
-1. Add to `/etc/pagerduty-dashboard.env`:
+The Linux console on `tty1` does not send mouse events to curses. The dashboard reads your touchscreen (or USB mouse) from evdev instead, while still treating it like a normal pointer.
+
+1. Install dependencies on the Pi: `.venv/bin/pip install -r requirements.txt`
+2. Add user `pi` to the `input` group, then reboot:
+
+   ```bash
+   sudo usermod -aG input pi
+   ```
+
+3. Add to `/etc/pagerduty-dashboard.env`:
 
    ```bash
    PAGERDUTY_BRIDGE_URL=http://192.168.1.50:8765/open
@@ -165,11 +175,16 @@ If you use a host firewall, allow the bridge port from the Pi’s IP only.
 
    Use your laptop’s LAN IP or hostname instead of `192.168.1.50`.
 
-2. Restart the dashboard service.
+4. Restart the dashboard service. On startup you should see `Pointer input: /dev/input/event…`.
 
 Click an incident row (touchscreen or USB mouse). The clicked line is **bold for one second** (underlined if it was already bold). The footer shows `Opened on laptop`, `Bridge unreachable`, or `No URL` for a few seconds.
 
-If clicks do nothing on the Pi console, check that the pointer device is active on `tty1` (some setups need `gpm` or a desktop session; the official touch display usually reports as a mouse to the framebuffer console).
+If auto-detection picks the wrong device, set `PAGERDUTY_POINTER_DEVICE` after checking:
+
+```bash
+grep -B2 -A5 Handlers= /proc/bus/input/devices
+# or: sudo evtest   # note which event node moves when you touch the screen
+```
 
 ## Start on boot
 
