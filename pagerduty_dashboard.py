@@ -464,8 +464,11 @@ def resolve_pointer_device(spec):
             score += 10
         elif ecodes.REL_X in rel_caps and ecodes.REL_Y in rel_caps:
             score += 6
-        if any(k in name for k in ("touch", "ft5406", "raspberrypi-ts", "ts")):
-            score += 20
+        if any(
+            k in name
+            for k in ("touch", "ft5406", "ft5x06", "generic ft5x06", "raspberrypi-ts")
+        ):
+            score += 25
         if "mouse" in name:
             score += 8
         if "keyboard" in name or "kbd" in name:
@@ -507,7 +510,13 @@ class PointerListener(threading.Thread):
                 c for c in (ecodes.BTN_LEFT, ecodes.BTN_TOUCH) if c is not None
             )
 
-        dev = InputDevice(self.device_path)
+        try:
+            dev = InputDevice(self.device_path)
+            dev.grab()
+        except OSError as e:
+            sys.stderr.write(f"Pointer device {self.device_path}: {e}\n")
+            return
+
         caps = dev.capabilities()
         abs_caps = caps.get(ecodes.EV_ABS, [])
         mt_pos_y = getattr(ecodes, "ABS_MT_POSITION_Y", None)
@@ -550,7 +559,7 @@ class PointerListener(threading.Thread):
                     elif event.type == ecodes.EV_REL and event.code == ecodes.REL_Y:
                         rel_y = max(0, rel_y + event.value)
                     elif event.type == ecodes.EV_KEY and event.code in PointerListener._CLICK_CODES:
-                        if event.value not in (0, 1):
+                        if event.value != 0:
                             continue
                         emit_row_click()
             except OSError:
@@ -577,6 +586,10 @@ def post_bridge(bridge_url, bridge_token, url, state):
 def activate_incident_at_row(term_row, scroll_pos, height, rows, resolved_rows, state, args):
     inc = incident_at_row(rows, resolved_rows, scroll_pos, term_row, height)
     if not inc:
+        if args.bridge_url:
+            with state["lock"]:
+                state["bridge_feedback"] = f"No row {term_row}"
+                state["bridge_feedback_until"] = time.monotonic() + 1.0
         return
     with state["lock"]:
         state["highlight_row"] = term_row
@@ -890,7 +903,19 @@ def main():
             )
             sys.exit(1)
         args.pointer_device = device
-        print(f"Pointer input: {device}")
+        try:
+            from evdev import InputDevice
+
+            probe = InputDevice(device)
+            pointer_name = probe.name
+            probe.close()
+        except OSError as e:
+            print(
+                f"Error: cannot open pointer device {device}: {e}\n"
+                "Add the service user to group 'input' (sudo usermod -aG input pi) and reboot."
+            )
+            sys.exit(1)
+        print(f"Pointer input: {device} ({pointer_name})")
 
     try:
         curses.wrapper(main_curses, client, args, service_ids)

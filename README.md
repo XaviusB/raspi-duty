@@ -171,6 +171,10 @@ The Linux console on `tty1` does not send mouse events to curses. The dashboard 
    ```bash
    PAGERDUTY_BRIDGE_URL=http://192.168.1.50:8765/open
    PAGERDUTY_BRIDGE_TOKEN=your_shared_secret_if_you_use_one
+   PAGERDUTY_POINTER_DEVICE=/dev/input/event6
+   ```
+
+   Official 7″ touch (`generic ft5x06`) is often `event6`; confirm with `sudo evtest`.
    ```
 
    Use your laptop’s LAN IP or hostname instead of `192.168.1.50`.
