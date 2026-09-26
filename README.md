@@ -38,6 +38,7 @@ Acknowledged incidents are always gray, including ones that were critical before
 | `q` | Quit |
 | `r` | Poll immediately |
 | Up / Down | Scroll the list |
+| Tap row | Open that incident in a browser on your laptop (when the laptop bridge is configured) |
 
 The list refreshes on its own every 30 seconds.
 
@@ -101,6 +102,10 @@ Before the full-screen view opens, a service filter prints the matched service n
 | `--interval` | `30` | Seconds between polls. |
 | `--limit` | `50` | Maximum incidents kept, newest first. |
 | `--no-alert-severity` | off | Skip the extra alert request and color open incidents by urgency. |
+| `--bridge-url` | `PAGERDUTY_BRIDGE_URL` | POST incident URLs to the laptop bridge when you tap a row. |
+| `--bridge-token` | `PAGERDUTY_BRIDGE_TOKEN` | Shared secret for the laptop bridge (optional). |
+| `--touch-device` | `PAGERDUTY_TOUCH_DEVICE` or `auto` | Touchscreen `/dev/input/event*` path. |
+| `--touch-cell-height` | `PAGERDUTY_TOUCH_CELL_HEIGHT` or `16` | Pixels per console row for mapping taps to incidents. |
 
 Examples:
 
@@ -114,6 +119,76 @@ Examples:
 ```
 
 `--service-name` asks PagerDuty for a partial, case-insensitive match, then keeps services whose name matches exactly when any do.
+
+## Open incidents on your laptop
+
+The Pi dashboard stays on the wall display. A second small program on your Linux laptop listens on the LAN and opens PagerDuty incident pages in your browser when you tap a row on the Pi.
+
+### Laptop: bridge
+
+No extra packages — Python 3 stdlib only.
+
+```bash
+cd /path/to/raspi-duty
+python3 pagerduty_laptop_bridge.py --host 0.0.0.0 --port 8765
+```
+
+Optional shared secret (use the same value on the Pi):
+
+```bash
+export PAGERDUTY_BRIDGE_TOKEN="$(openssl rand -hex 16)"
+python3 pagerduty_laptop_bridge.py --host 0.0.0.0 --port 8765 --token "$PAGERDUTY_BRIDGE_TOKEN"
+```
+
+The bridge only opens `https://…pagerduty.com/…` URLs. Test locally:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" -X POST http://127.0.0.1:8765/open \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://notallowed.example/"}'
+# expect 400
+
+curl -X POST http://127.0.0.1:8765/open \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://yoursubdomain.pagerduty.com/incidents/XXXX"}'
+# browser should open
+```
+
+If you use a host firewall, allow the bridge port from the Pi’s IP only.
+
+### Pi: enable tap-to-open
+
+1. Install dependencies again so `evdev` is present: `.venv/bin/pip install -r requirements.txt`
+2. Add the user that runs the dashboard to the `input` group (then log out or reboot):
+
+   ```bash
+   sudo usermod -aG input pi
+   ```
+
+3. Find the touchscreen device if auto-detection fails:
+
+   ```bash
+   libinput list-devices
+   # or: ls -l /dev/input/by-id/
+   ```
+
+4. Add to `/etc/pagerduty-dashboard.env`:
+
+   ```bash
+   PAGERDUTY_BRIDGE_URL=http://192.168.1.50:8765/open
+   PAGERDUTY_BRIDGE_TOKEN=your_shared_secret_if_you_use_one
+   # optional:
+   # PAGERDUTY_TOUCH_DEVICE=/dev/input/event2
+   # PAGERDUTY_TOUCH_CELL_HEIGHT=16
+   ```
+
+   Use your laptop’s LAN IP or hostname instead of `192.168.1.50`.
+
+5. Extend the systemd `ExecStart` if you prefer flags over env vars, then restart the service.
+
+Tap an incident row. The footer shows `Opened on laptop`, `Bridge unreachable`, or `No URL` for a few seconds.
+
+**Calibration:** On the Pi console, one text row is often 16 pixels tall. If taps hit the wrong incident, try `--touch-cell-height` values such as `12` or `20` until a tap lands on the intended row.
 
 ## Start on boot
 
