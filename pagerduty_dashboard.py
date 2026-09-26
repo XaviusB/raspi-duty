@@ -5,7 +5,7 @@ PagerDuty Console Dashboard
 A lightweight terminal (curses) dashboard for Raspberry Pi that polls the
 PagerDuty REST API and shows live incidents, color-coded by severity:
 
-    GREEN  = resolved / closed
+    GREEN  = resolved / closed (fills unused lines at the bottom)
     ORANGE = warning severity (open)
     RED    = critical severity (open)
     GRAY   = acknowledged
@@ -93,14 +93,20 @@ class PagerDutyClient:
             resp.raise_for_status()
             return resp.json()
 
-    def list_incidents(self, statuses=("triggered", "acknowledged", "resolved"), limit=50, service_ids=None):
+    def list_incidents(
+        self,
+        statuses=("triggered", "acknowledged", "resolved"),
+        limit=50,
+        service_ids=None,
+        sort_by="created_at:desc",
+    ):
         """Fetch recent incidents, newest first, with pagination."""
         incidents = []
         offset = 0
         while True:
             params = {
                 "statuses[]": list(statuses),
-                "sort_by": "created_at:desc",
+                "sort_by": sort_by,
                 "limit": min(limit, 100),
                 "offset": offset,
                 "total": "false",
@@ -231,38 +237,47 @@ class Poller(threading.Thread):
             self._force.wait(self.interval)
             self._force.clear()
 
+    def _to_row(self, inc):
+        status = inc.get("status")
+        if status == "acknowledged":
+            sev = None
+        elif status == "resolved":
+            sev = SEV_RESOLVED
+        elif self.use_alert_severity:
+            sev = resolve_severity(self.client, inc, self.cache)
+        else:
+            sev = SEV_CRITICAL if inc.get("urgency") == "high" else SEV_WARNING
+        return {
+            "id": inc.get("id"),
+            "number": inc.get("incident_number"),
+            "title": inc.get("title") or inc.get("summary") or "",
+            "service": (inc.get("service") or {}).get("summary", "?"),
+            "status": status,
+            "urgency": inc.get("urgency"),
+            "created_at": inc.get("created_at"),
+            "severity": sev,
+            "html_url": inc.get("html_url"),
+        }
+
     def _poll_once(self):
         try:
-            incidents = self.client.list_incidents(
-                statuses=self.statuses, limit=self.limit, service_ids=self.service_ids
-            )
+            open_statuses = [status for status in self.statuses if status != "resolved"]
             rows = []
-            for inc in incidents:
-                if inc.get("status") == "acknowledged":
-                    sev = None
-                elif self.use_alert_severity:
-                    sev = resolve_severity(self.client, inc, self.cache)
-                else:
-                    sev = (
-                        SEV_RESOLVED
-                        if inc.get("status") == "resolved"
-                        else (SEV_CRITICAL if inc.get("urgency") == "high" else SEV_WARNING)
-                    )
-                rows.append(
-                    {
-                        "id": inc.get("id"),
-                        "number": inc.get("incident_number"),
-                        "title": inc.get("title") or inc.get("summary") or "",
-                        "service": (inc.get("service") or {}).get("summary", "?"),
-                        "status": inc.get("status"),
-                        "urgency": inc.get("urgency"),
-                        "created_at": inc.get("created_at"),
-                        "severity": sev,
-                        "html_url": inc.get("html_url"),
-                    }
+            if open_statuses:
+                incidents = self.client.list_incidents(
+                    statuses=open_statuses, limit=self.limit, service_ids=self.service_ids
                 )
+                rows = [self._to_row(inc) for inc in incidents]
+            resolved = self.client.list_incidents(
+                statuses=["resolved"],
+                limit=self.limit,
+                service_ids=self.service_ids,
+                sort_by="resolved_at:desc",
+            )
+            resolved_rows = [self._to_row(inc) for inc in resolved]
             with self.state["lock"]:
                 self.state["rows"] = rows
+                self.state["resolved_rows"] = resolved_rows
                 self.state["last_update"] = datetime.now(timezone.utc)
                 self.state["error"] = None
         except requests.HTTPError as e:
@@ -341,6 +356,29 @@ def fmt_age(iso_ts):
     return f"{secs // 86400}d"
 
 
+def layout_incidents(open_rows, resolved_rows, body_height, scroll_pos):
+    """Place open incidents first, then fill leftover lines with resolved ones.
+
+    Returns (visible_open, show_separator, visible_resolved, scroll_pos).
+    The separator is drawn only when a resolved incident can sit under it.
+    One leftover line is used for the newest resolved incident.
+    """
+    if body_height < 1:
+        return [], False, [], 0
+
+    max_scroll = max(0, len(open_rows) - body_height)
+    scroll_pos = min(max(0, scroll_pos), max_scroll)
+    visible_open = open_rows[scroll_pos:scroll_pos + body_height]
+    free = body_height - len(visible_open)
+    if free <= 0 or not resolved_rows:
+        return visible_open, False, [], scroll_pos
+    if visible_open and free == 1:
+        return visible_open, False, resolved_rows[:1], scroll_pos
+    if not visible_open and body_height == 1:
+        return [], False, resolved_rows[:1], scroll_pos
+    return visible_open, True, resolved_rows[: free - 1], scroll_pos
+
+
 def safe_addnstr(stdscr, y, x, text, n, attr=0):
     """addnstr that swallows the harmless 'wrote to bottom-right cell' curses.error."""
     try:
@@ -359,6 +397,7 @@ def draw(stdscr, state, scroll_pos):
 
     with state["lock"]:
         rows = list(state.get("rows", []))
+        resolved_rows = list(state.get("resolved_rows", []))
         last_update = state.get("last_update")
         error = state.get("error")
 
@@ -371,7 +410,7 @@ def draw(stdscr, state, scroll_pos):
     header = title.ljust(width)
     safe_addnstr(stdscr, 0, 0, header, row_width(0), curses.color_pair(COLOR_HEADER_PAIR) | curses.A_BOLD)
 
-    counts = {SEV_CRITICAL: 0, SEV_WARNING: 0, SEV_RESOLVED: 0, "acknowledged": 0}
+    counts = {SEV_CRITICAL: 0, SEV_WARNING: 0, SEV_RESOLVED: len(resolved_rows), "acknowledged": 0}
     for r in rows:
         if r.get("status") == "acknowledged":
             counts["acknowledged"] += 1
@@ -383,7 +422,7 @@ def draw(stdscr, state, scroll_pos):
         f"Warning: {counts[SEV_WARNING]}   "
         f"Acknowledged: {counts['acknowledged']}   "
         f"Resolved: {counts[SEV_RESOLVED]}   "
-        f"Total: {len(rows)}"
+        f"Total: {len(rows) + len(resolved_rows)}"
     )
     safe_addnstr(stdscr, 1, 0, status_line, row_width(1), curses.A_BOLD)
 
@@ -401,19 +440,34 @@ def draw(stdscr, state, scroll_pos):
 
     # --- Rows ---
     list_top = 4
-    visible_rows = height - list_top - 1
-    if visible_rows < 1:
-        visible_rows = 1
+    body_height = height - list_top - 1
+    visible_open, show_separator, visible_resolved, scroll_pos = layout_incidents(
+        rows, resolved_rows, body_height, scroll_pos
+    )
 
-    max_scroll = max(0, len(rows) - visible_rows)
-    scroll_pos = min(scroll_pos, max_scroll)
-
-    for i, r in enumerate(rows[scroll_pos: scroll_pos + visible_rows]):
-        y = list_top + i
-        line = f"{fmt_age(r['created_at']):<6}{r['title']}"
+    def paint_incident(y, incident):
+        line = f"{fmt_age(incident['created_at']):<6}{incident['title']}"
         safe_addnstr(
-            stdscr, y, 0, line[: width - 1], row_width(y), color_for(r["severity"], r.get("status"))
+            stdscr,
+            y,
+            0,
+            line[: width - 1],
+            row_width(y),
+            color_for(incident["severity"], incident.get("status")),
         )
+
+    y = list_top
+    for incident in visible_open:
+        paint_incident(y, incident)
+        y += 1
+    if show_separator:
+        label = " resolved "
+        separator = label.center(max(width - 1, len(label)), "-")
+        safe_addnstr(stdscr, y, 0, separator, row_width(y), curses.color_pair(COLOR_DIM_PAIR))
+        y += 1
+    for incident in visible_resolved:
+        paint_incident(y, incident)
+        y += 1
 
     # --- Footer ---
     footer = " [q] quit   [r] refresh   [UP/DOWN] scroll "
@@ -429,7 +483,13 @@ def main_curses(stdscr, client, args, service_ids):
     stdscr.timeout(300)
     init_colors()
 
-    state = {"lock": threading.Lock(), "rows": [], "last_update": None, "error": None}
+    state = {
+        "lock": threading.Lock(),
+        "rows": [],
+        "resolved_rows": [],
+        "last_update": None,
+        "error": None,
+    }
     poller = Poller(
         client,
         interval=args.interval,
@@ -473,7 +533,9 @@ def main():
         "--status",
         action="append",
         choices=["triggered", "acknowledged", "resolved"],
-        help="Incident status to include (repeatable). Default: triggered and acknowledged.",
+        help="Incident status to include in the main list (repeatable). "
+        "Default: triggered and acknowledged. The newest resolved incidents "
+        "always fill the unused lines below that list.",
     )
     parser.add_argument(
         "--service-name",

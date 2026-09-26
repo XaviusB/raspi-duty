@@ -12,11 +12,13 @@ A read-only PagerDuty API key is enough. The dashboard never acknowledges, resol
  AGE   TITLE
  12m   Database primary is down
  4h    Disk space warning
- 1d    Checkout latency
+---------------- resolved ----------------
+ 2h    Checkout latency
+ 1d    Disk cleanup finished
  [q] quit   [r] refresh   [UP/DOWN] scroll
 ```
 
-Each row is the incident age (time since it was created) and its title. The clock on the right is the last successful poll, in local time. API and network errors appear in red on the line under the counts; the previous list stays on screen.
+Each row is the incident age (time since it was created) and its title. Triggered and acknowledged incidents come first. A `resolved` separator follows them, and the newest resolved incidents fill the blank lines under it, in green. When the open list already fills the screen, those lines stay hidden until a row frees up. The clock on the right is the last successful poll, in local time. API and network errors appear in red on the line under the counts; the previous list stays on screen.
 
 ## Colors
 
@@ -25,7 +27,7 @@ Each row is the incident age (time since it was created) and its title. The cloc
 | Red | Triggered incident whose first alert is `critical` or `error`. Also used when that alert has no severity. |
 | Orange | Triggered incident whose first alert is `warning` or `info`. |
 | Light gray | Acknowledged incident. |
-| Green | Resolved incident. Hidden unless you ask for that status. |
+| Green | Resolved incident, shown under the separator in the leftover lines. |
 
 Acknowledged incidents are always gray, including ones that were critical before someone acknowledged them. With `--no-alert-severity`, open incidents are colored from urgency instead: `high` is red and anything else is orange.
 
@@ -95,7 +97,7 @@ Before the full-screen view opens, a service filter prints the matched service n
 | `--token` | `PAGERDUTY_API_TOKEN` | REST API token. Required. |
 | `--service-name` | `PAGERDUTY_SERVICE_NAME` | Show one service, matched by name. Empty or unset shows every service. |
 | `--service-id` | none | Show these service IDs. Repeat the flag for more than one. Overrides `--service-name`. |
-| `--status` | `triggered` and `acknowledged` | Statuses to include. Repeat the flag. Choices: `triggered`, `acknowledged`, `resolved`. |
+| `--status` | `triggered` and `acknowledged` | Statuses in the main list. Repeat the flag. Choices: `triggered`, `acknowledged`, `resolved`. Resolved incidents also fill the unused lines below that list. |
 | `--interval` | `30` | Seconds between polls. |
 | `--limit` | `50` | Maximum incidents kept, newest first. |
 | `--no-alert-severity` | off | Skip the extra alert request and color open incidents by urgency. |
@@ -103,12 +105,9 @@ Before the full-screen view opens, a service filter prints the matched service n
 Examples:
 
 ```bash
-# Triggered incidents only
+# Triggered incidents only; acknowledged ones stay hidden.
+# Resolved incidents still fill the leftover lines.
 .venv/bin/python pagerduty_dashboard.py --status triggered
-
-# Include resolved incidents in green
-.venv/bin/python pagerduty_dashboard.py \
-  --status triggered --status acknowledged --status resolved
 
 # Two services, by ID
 .venv/bin/python pagerduty_dashboard.py --service-id PXXXXXX --service-id PYYYYYY
@@ -177,3 +176,4 @@ sudo systemctl enable --now getty@tty1.service
 | Poll seems stuck after heavy use | PagerDuty returned HTTP 429. The client waits for the `Retry-After` header, then retries the same request. |
 | Red incident you expected to be orange | The first alert has no severity, or its severity is `critical` or `error`. |
 | Acknowledged incident missing | The process was started with `--status triggered` only. |
+| Resolved incidents missing | The open list fills the screen, so there is no free line under the separator. |
