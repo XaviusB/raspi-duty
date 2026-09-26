@@ -46,8 +46,8 @@ Controls
     r       force refresh
     UP/DOWN scroll the incident list
 
-When --bridge-url is set, tap an incident row on the touchscreen to open it
-on your laptop (see pagerduty_laptop_bridge.py).
+When --bridge-url is set, click an incident row (mouse or touchscreen-as-mouse)
+to open it on your laptop (see pagerduty_laptop_bridge.py).
 """
 
 import argparse
@@ -409,26 +409,13 @@ def incident_at_row(rows, resolved_rows, scroll_pos, term_row, height):
     return None
 
 
-def resolve_touch_device(spec):
-    """Return a /dev/input/event* path for the touchscreen, or None."""
-    try:
-        from evdev import InputDevice, ecodes, list_devices
-    except ImportError:
-        return None
-    if spec and spec != "auto":
-        return spec
-    for path in list_devices():
-        try:
-            dev = InputDevice(path)
-        except OSError:
-            continue
-        caps = dev.capabilities()
-        abs_caps = caps.get(ecodes.EV_ABS, [])
-        keys = caps.get(ecodes.EV_KEY, [])
-        has_xy = ecodes.ABS_X in abs_caps and ecodes.ABS_Y in abs_caps
-        if has_xy and ecodes.BTN_TOUCH in keys:
-            return path
-    return None
+MOUSE_CLICK_MASK = (
+    curses.BUTTON1_CLICKED | curses.BUTTON1_RELEASED | curses.BUTTON1_PRESSED
+)
+
+
+def is_mouse_click(bstate):
+    return bool(bstate & MOUSE_CLICK_MASK)
 
 
 def post_bridge(bridge_url, bridge_token, url, state):
@@ -448,41 +435,26 @@ def post_bridge(bridge_url, bridge_token, url, state):
         state["bridge_feedback_until"] = time.monotonic() + 3
 
 
-class TouchListener(threading.Thread):
-    def __init__(self, device_path, on_tap, stop_event):
-        super().__init__(daemon=True)
-        self.device_path = device_path
-        self.on_tap = on_tap
-        self._stop = stop_event
-
-    def run(self):
-        import select
-
-        from evdev import InputDevice, ecodes
-
-        dev = InputDevice(self.device_path)
-        x, y = 0, 0
-        while not self._stop.is_set():
-            try:
-                ready, _, _ = select.select([dev.fd], [], [], 0.25)
-                if not ready:
-                    continue
-                for event in dev.read():
-                    if self._stop.is_set():
-                        break
-                    if event.type == ecodes.EV_ABS:
-                        if event.code == ecodes.ABS_X:
-                            x = event.value
-                        elif event.code == ecodes.ABS_Y:
-                            y = event.value
-                    elif (
-                        event.type == ecodes.EV_KEY
-                        and event.code == ecodes.BTN_TOUCH
-                        and event.value == 0
-                    ):
-                        self.on_tap(x, y)
-            except OSError:
-                break
+def activate_incident_at_row(term_row, scroll_pos, height, rows, resolved_rows, state, args):
+    inc = incident_at_row(rows, resolved_rows, scroll_pos, term_row, height)
+    if not inc:
+        return
+    with state["lock"]:
+        state["highlight_row"] = term_row
+        state["highlight_until"] = time.monotonic() + 1.0
+    if not args.bridge_url:
+        return
+    url = inc.get("html_url")
+    if not url:
+        with state["lock"]:
+            state["bridge_feedback"] = "No URL"
+            state["bridge_feedback_until"] = time.monotonic() + 3
+        return
+    threading.Thread(
+        target=post_bridge,
+        args=(args.bridge_url, args.bridge_token, url, state),
+        daemon=True,
+    ).start()
 
 
 def safe_addnstr(stdscr, y, x, text, n, attr=0):
@@ -551,15 +523,26 @@ def draw(stdscr, state, scroll_pos):
         rows, resolved_rows, body_height, scroll_pos
     )
 
+    with state["lock"]:
+        highlight_row = state.get("highlight_row")
+        highlight_until = state.get("highlight_until") or 0
+    now = time.monotonic()
+
     def paint_incident(y, incident):
         line = f"{fmt_age(incident['created_at']):<6}{incident['title']}"
+        attr = color_for(incident["severity"], incident.get("status"))
+        if highlight_row == y and now < highlight_until:
+            if attr & curses.A_BOLD:
+                attr |= curses.A_UNDERLINE
+            else:
+                attr |= curses.A_BOLD
         safe_addnstr(
             stdscr,
             y,
             0,
             line[: width - 1],
             row_width(y),
-            color_for(incident["severity"], incident.get("status")),
+            attr,
         )
 
     y = list_top
@@ -582,6 +565,8 @@ def draw(stdscr, state, scroll_pos):
         if time.monotonic() < until:
             feedback = state.get("bridge_feedback")
     footer = " [q] quit   [r] refresh   [UP/DOWN] scroll "
+    if state.get("bridge_enabled"):
+        footer += "  [click] open "
     if feedback:
         footer = f" {feedback} |" + footer
     safe_addnstr(stdscr, last_row, 0, footer.ljust(width), safe_width, curses.color_pair(COLOR_HEADER_PAIR))
@@ -602,6 +587,7 @@ def main_curses(stdscr, client, args, service_ids):
         "resolved_rows": [],
         "last_update": None,
         "error": None,
+        "bridge_enabled": bool(args.bridge_url),
     }
     poller = Poller(
         client,
@@ -614,42 +600,14 @@ def main_curses(stdscr, client, args, service_ids):
     )
     poller.start()
 
-    touch_stop = threading.Event()
-    touch_thread = None
     if args.bridge_url:
-
-        def on_tap(x_pixel, y_pixel):
-            term_row = y_pixel // args.touch_cell_height
-            with state["lock"]:
-                scroll = state.get("scroll_pos", 0)
-                term_height = state.get("term_height", 24)
-                rows = list(state.get("rows", []))
-                resolved_rows = list(state.get("resolved_rows", []))
-            inc = incident_at_row(rows, resolved_rows, scroll, term_row, term_height)
-            if not inc:
-                return
-            url = inc.get("html_url")
-            if not url:
-                with state["lock"]:
-                    state["bridge_feedback"] = "No URL"
-                    state["bridge_feedback_until"] = time.monotonic() + 3
-                return
-            threading.Thread(
-                target=post_bridge,
-                args=(args.bridge_url, args.bridge_token, url, state),
-                daemon=True,
-            ).start()
-
-        touch_thread = TouchListener(args.touch_device, on_tap, touch_stop)
-        touch_thread.start()
+        curses.mousemask(MOUSE_CLICK_MASK)
+        curses.mouseinterval(0)
 
     scroll_pos = 0
     try:
         while True:
             height, _ = stdscr.getmaxyx()
-            with state["lock"]:
-                state["scroll_pos"] = scroll_pos
-                state["term_height"] = height
             scroll_pos = draw(stdscr, state, scroll_pos)
             ch = stdscr.getch()
             if ch in (ord("q"), ord("Q")):
@@ -660,12 +618,21 @@ def main_curses(stdscr, client, args, service_ids):
                 scroll_pos += 1
             elif ch == curses.KEY_UP:
                 scroll_pos = max(0, scroll_pos - 1)
+            elif ch == curses.KEY_MOUSE and args.bridge_url:
+                try:
+                    _, _mx, my, _, bstate = curses.getmouse()
+                except curses.error:
+                    continue
+                if is_mouse_click(bstate):
+                    with state["lock"]:
+                        rows = list(state.get("rows", []))
+                        resolved_rows = list(state.get("resolved_rows", []))
+                    activate_incident_at_row(
+                        my, scroll_pos, height, rows, resolved_rows, state, args
+                    )
             elif ch == curses.KEY_RESIZE:
                 stdscr.clear()
     finally:
-        touch_stop.set()
-        if touch_thread is not None:
-            touch_thread.join(timeout=1)
         poller.stop()
 
 
@@ -712,17 +679,6 @@ def main():
         default=os.environ.get("PAGERDUTY_BRIDGE_TOKEN"),
         help="Shared secret for the laptop bridge (or set PAGERDUTY_BRIDGE_TOKEN)",
     )
-    parser.add_argument(
-        "--touch-device",
-        default=os.environ.get("PAGERDUTY_TOUCH_DEVICE", "auto"),
-        help="Touchscreen evdev path, or 'auto' (default). Set PAGERDUTY_TOUCH_DEVICE to override.",
-    )
-    parser.add_argument(
-        "--touch-cell-height",
-        type=int,
-        default=int(os.environ.get("PAGERDUTY_TOUCH_CELL_HEIGHT", "16")),
-        help="Framebuffer pixels per curses row for touch mapping (default: 16)",
-    )
     args = parser.parse_args()
 
     if not args.status:
@@ -747,21 +703,6 @@ def main():
             print(f"No PagerDuty service found matching '{args.service_name}'.")
             sys.exit(1)
         print(f"Filtering to service(s): {', '.join(names)}")
-
-    if args.bridge_url:
-        try:
-            import evdev  # noqa: F401
-        except ImportError:
-            print("Error: evdev is required when --bridge-url is set. Install with: pip install evdev")
-            sys.exit(1)
-        device = resolve_touch_device(args.touch_device)
-        if not device:
-            print(
-                "Error: no touchscreen device found. Set --touch-device or PAGERDUTY_TOUCH_DEVICE "
-                "to an /dev/input/event* path."
-            )
-            sys.exit(1)
-        args.touch_device = device
 
     try:
         curses.wrapper(main_curses, client, args, service_ids)
