@@ -512,10 +512,16 @@ class PointerListener(threading.Thread):
 
         try:
             dev = InputDevice(self.device_path)
-            dev.grab()
         except OSError as e:
             sys.stderr.write(f"Pointer device {self.device_path}: {e}\n")
             return
+        try:
+            dev.grab()
+        except OSError:
+            sys.stderr.write(
+                f"Pointer: could not grab {self.device_path} "
+                "(reading without exclusive access)\n"
+            )
 
         caps = dev.capabilities()
         abs_caps = caps.get(ecodes.EV_ABS, [])
@@ -586,10 +592,9 @@ def post_bridge(bridge_url, bridge_token, url, state):
 def activate_incident_at_row(term_row, scroll_pos, height, rows, resolved_rows, state, args):
     inc = incident_at_row(rows, resolved_rows, scroll_pos, term_row, height)
     if not inc:
-        if args.bridge_url:
-            with state["lock"]:
-                state["bridge_feedback"] = f"No row {term_row}"
-                state["bridge_feedback_until"] = time.monotonic() + 1.0
+        with state["lock"]:
+            state["bridge_feedback"] = f"No row {term_row}"
+            state["bridge_feedback_until"] = time.monotonic() + 1.0
         return
     with state["lock"]:
         state["highlight_row"] = term_row
@@ -717,7 +722,7 @@ def draw(stdscr, state, scroll_pos):
         if time.monotonic() < until:
             feedback = state.get("bridge_feedback")
     footer = " [q] quit   [r] refresh   [UP/DOWN] scroll "
-    if state.get("bridge_enabled"):
+    if state.get("pointer_enabled"):
         footer += "  [click] open "
     if feedback:
         footer = f" {feedback} |" + footer
@@ -740,6 +745,7 @@ def main_curses(stdscr, client, args, service_ids):
         "last_update": None,
         "error": None,
         "bridge_enabled": bool(args.bridge_url),
+        "pointer_enabled": bool(args.pointer_device),
     }
     poller = Poller(
         client,
@@ -758,11 +764,16 @@ def main_curses(stdscr, client, args, service_ids):
         curses.mousemask(MOUSE_CLICK_MASK)
         curses.mouseinterval(0)
 
+    if args.pointer_device:
+
         def term_height_fn():
             with state["lock"]:
                 return state.get("term_height", 24)
 
         def on_row_click(term_row):
+            if args.debug_pointer:
+                sys.stderr.write(f"pointer: row {term_row}\n")
+                sys.stderr.flush()
             with state["lock"]:
                 scroll = state.get("scroll_pos", 0)
                 height = state.get("term_height", 24)
@@ -772,11 +783,10 @@ def main_curses(stdscr, client, args, service_ids):
                 term_row, scroll, height, rows, resolved_rows, state, args
             )
 
-        if args.pointer_device:
-            pointer_thread = PointerListener(
-                args.pointer_device, on_row_click, term_height_fn, pointer_stop
-            )
-            pointer_thread.start()
+        pointer_thread = PointerListener(
+            args.pointer_device, on_row_click, term_height_fn, pointer_stop
+        )
+        pointer_thread.start()
 
     scroll_pos = 0
     try:
@@ -814,6 +824,44 @@ def main_curses(stdscr, client, args, service_ids):
         if pointer_thread is not None:
             pointer_thread.join(timeout=1)
         poller.stop()
+
+
+def _resolve_pointer_for_startup(args):
+    """Open the evdev pointer if available; return device path or None."""
+    try:
+        import evdev  # noqa: F401
+    except ImportError:
+        if args.bridge_url:
+            print("Error: evdev is required for clicks. Install with: pip install evdev")
+            sys.exit(1)
+        return None
+
+    device = resolve_pointer_device(args.pointer_device)
+    if not device:
+        if args.bridge_url:
+            print(
+                "Error: no mouse/touch device found. Set --pointer-device or "
+                "PAGERDUTY_POINTER_DEVICE (e.g. /dev/input/event6)."
+            )
+            sys.exit(1)
+        return None
+
+    try:
+        from evdev import InputDevice
+
+        probe = InputDevice(device)
+        pointer_name = probe.name
+        probe.close()
+    except OSError as e:
+        print(
+            f"Error: cannot open pointer device {device}: {e}\n"
+            "Run on the Pi console (tty1), stop systemd first, and ensure the user is in "
+            "group 'input' (sudo usermod -aG input pi) or use sudo for a quick test."
+        )
+        sys.exit(1)
+
+    print(f"Pointer input: {device} ({pointer_name})")
+    return device
 
 
 def main():
@@ -864,6 +912,12 @@ def main():
         default=os.environ.get("PAGERDUTY_POINTER_DEVICE", "auto"),
         help="Mouse/touch evdev path, or 'auto' (default). Set PAGERDUTY_POINTER_DEVICE to override.",
     )
+    parser.add_argument(
+        "--debug-pointer",
+        action="store_true",
+        default=bool(os.environ.get("PAGERDUTY_DEBUG_POINTER")),
+        help="Log touch/mouse row mapping on stderr (or set PAGERDUTY_DEBUG_POINTER=1)",
+    )
     args = parser.parse_args()
 
     if not args.status:
@@ -889,33 +943,7 @@ def main():
             sys.exit(1)
         print(f"Filtering to service(s): {', '.join(names)}")
 
-    if args.bridge_url:
-        try:
-            import evdev  # noqa: F401
-        except ImportError:
-            print("Error: evdev is required when --bridge-url is set. Install with: pip install evdev")
-            sys.exit(1)
-        device = resolve_pointer_device(args.pointer_device)
-        if not device:
-            print(
-                "Error: no mouse/touch device found for clicks. Set --pointer-device or "
-                "PAGERDUTY_POINTER_DEVICE to an /dev/input/event* path."
-            )
-            sys.exit(1)
-        args.pointer_device = device
-        try:
-            from evdev import InputDevice
-
-            probe = InputDevice(device)
-            pointer_name = probe.name
-            probe.close()
-        except OSError as e:
-            print(
-                f"Error: cannot open pointer device {device}: {e}\n"
-                "Add the service user to group 'input' (sudo usermod -aG input pi) and reboot."
-            )
-            sys.exit(1)
-        print(f"Pointer input: {device} ({pointer_name})")
+    args.pointer_device = _resolve_pointer_for_startup(args)
 
     try:
         curses.wrapper(main_curses, client, args, service_ids)

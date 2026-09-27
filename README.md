@@ -89,6 +89,33 @@ Or pass the values on the command line:
 
 Before the full-screen view opens, a service filter prints the matched service names. If the name does not match, the program exits and leaves the console usable.
 
+### Run on the Pi console (debug touch / click)
+
+Clicks are read from `/dev/input/event*`, not from SSH. Use the Pi’s display:
+
+1. Stop the systemd unit so it does not own `tty1` or the touch device.
+2. On the Pi (local keyboard), switch to the console if needed: **Ctrl+Alt+F1**.
+3. Log in as `pi`, then:
+
+```bash
+cd /home/pi/raspi-duty
+chmod +x run-on-console.sh
+./run-on-console.sh
+```
+
+The helper loads `/etc/pagerduty-dashboard.env`, defaults `PAGERDUTY_POINTER_DEVICE` to `/dev/input/event6` (ft5x06), and enables pointer debug on stderr. You should see `Pointer input: /dev/input/event6 (...)` then, when you touch, lines like `pointer: row 7`. The footer shows `No row N` if the tap missed the list.
+
+Quick test without the script:
+
+```bash
+sudo systemctl stop pagerduty-dashboard.service
+set -a; . /etc/pagerduty-dashboard.env; set +a
+export PAGERDUTY_POINTER_DEVICE=/dev/input/event6
+.venv/bin/python pagerduty_dashboard.py --debug-pointer
+```
+
+If opening the device fails, try once with `sudo ./run-on-console.sh` to rule out permissions (then fix `input` group and reboot).
+
 ## Options
 
 `pagerduty_dashboard.py --help` prints the same list.
@@ -175,7 +202,6 @@ The Linux console on `tty1` does not send mouse events to curses. The dashboard 
    ```
 
    Official 7″ touch (`generic ft5x06`) is often `event6`; confirm with `sudo evtest`.
-   ```
 
    Use your laptop’s LAN IP or hostname instead of `192.168.1.50`.
 
