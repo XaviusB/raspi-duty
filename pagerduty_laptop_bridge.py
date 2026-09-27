@@ -69,8 +69,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return True
         return False
 
+    def _post_path_ok(self):
+        path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        return path in ("/", "/open")
+
     def do_POST(self):
-        if self.path.rstrip("/") != "/open":
+        if not self._post_path_ok():
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
             return
         if not self._auth_ok():

@@ -196,7 +196,8 @@ The Linux console on `tty1` does not send mouse events to curses. The dashboard 
 3. Add to `/etc/pagerduty-dashboard.env`:
 
    ```bash
-   PAGERDUTY_BRIDGE_URL=http://192.168.1.50:8765/open
+   PAGERDUTY_BRIDGE_URL=http://192.168.1.50:8765
+   # /open is appended automatically if omitted
    PAGERDUTY_BRIDGE_TOKEN=your_shared_secret_if_you_use_one
    PAGERDUTY_POINTER_DEVICE=/dev/input/event6
    ```

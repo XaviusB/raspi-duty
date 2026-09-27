@@ -492,10 +492,11 @@ class PointerListener(threading.Thread):
         self.term_height_fn = term_height_fn
         self._stop = stop_event
         self._last_click = 0.0
+        self._click_debounce_s = 0.6
 
     def _maybe_click(self, term_row):
         now = time.monotonic()
-        if now - self._last_click < 0.25:
+        if now - self._last_click < self._click_debounce_s:
             return
         self._last_click = now
         self.on_row_click(term_row)
@@ -538,6 +539,8 @@ class PointerListener(threading.Thread):
             y_absinfo = None
         rel_y = 0
         y = 0
+        use_mt_release = mt_track is not None
+        pending_lift = False
 
         def emit_row_click():
             term_height = self.term_height_fn()
@@ -560,16 +563,34 @@ class PointerListener(threading.Thread):
                             y = event.value
                         elif mt_pos_y is not None and event.code == mt_pos_y:
                             y = event.value
-                        elif mt_track is not None and event.code == mt_track and event.value == -1:
+                        elif use_mt_release and event.code == mt_track and event.value == -1:
+                            pending_lift = True
+                    elif event.type == ecodes.EV_SYN and event.code == ecodes.SYN_REPORT:
+                        if pending_lift:
+                            pending_lift = False
                             emit_row_click()
                     elif event.type == ecodes.EV_REL and event.code == ecodes.REL_Y:
                         rel_y = max(0, rel_y + event.value)
-                    elif event.type == ecodes.EV_KEY and event.code in PointerListener._CLICK_CODES:
+                    elif (
+                        not use_mt_release
+                        and event.type == ecodes.EV_KEY
+                        and event.code in PointerListener._CLICK_CODES
+                    ):
                         if event.value != 0:
                             continue
                         emit_row_click()
             except OSError:
                 break
+
+
+def normalize_bridge_url(bridge_url):
+    """Ensure POST target is .../open (env often omits the path)."""
+    if not bridge_url:
+        return bridge_url
+    base = bridge_url.rstrip("/")
+    if base.endswith("/open"):
+        return base
+    return f"{base}/open"
 
 
 def post_bridge(bridge_url, bridge_token, url, state):
@@ -607,6 +628,14 @@ def activate_incident_at_row(term_row, scroll_pos, height, rows, resolved_rows, 
             state["bridge_feedback"] = "No URL"
             state["bridge_feedback_until"] = time.monotonic() + 3
         return
+    now = time.monotonic()
+    with state["lock"]:
+        last_url = state.get("last_bridge_url")
+        last_at = state.get("last_bridge_at") or 0
+        if url == last_url and now - last_at < 2.0:
+            return
+        state["last_bridge_url"] = url
+        state["last_bridge_at"] = now
     threading.Thread(
         target=post_bridge,
         args=(args.bridge_url, args.bridge_token, url, state),
@@ -922,6 +951,9 @@ def main():
 
     if not args.status:
         args.status = ["triggered", "acknowledged"]
+
+    if args.bridge_url:
+        args.bridge_url = normalize_bridge_url(args.bridge_url)
 
     if not args.token:
         print("Error: no API token provided. Use --token or set PAGERDUTY_API_TOKEN.")
